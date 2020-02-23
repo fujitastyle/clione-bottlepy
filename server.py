@@ -1,7 +1,7 @@
 import bottle
 from bottle import get, post, route, request, response, abort, static_file
 from bottle.ext import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, Sequence, String, desc
+from sqlalchemy import create_engine, Column, Integer, Sequence, String, ARRAY, desc
 from sqlalchemy.ext.declarative import declarative_base
 import json
 import collections
@@ -52,7 +52,8 @@ class User(Base):
     summary = Column(String)
     privatekey = Column(String)
     publickey = Column(String)
-#   iconurl = Column(String)
+    following = Column(ARRAY(String))
+    followers = Column(ARRAY(String))
 
     def __init__(self, username, password, fullname, summary, privatekey, publickey):
         self.username = username
@@ -81,6 +82,7 @@ class Post(Base):
 
     def __repr__(self):
         return "<Post('%d', '%s', '%s', '%s', %d)>" % (self.id, self.username, self.posttext, self.postdate, self.liked)
+
 
 ##web
 @app.route('/')
@@ -187,7 +189,11 @@ def do_post(db):
             'https://www.w3.org/ns/activitystreams#Public',
         ]
     }
-    return json.dumps(note)
+    create = {
+        '@context': 'https://www.w3.org/ns/activitystreams',
+        'type': 'Create',
+        'object': note
+    }
     return 'done: '+posttext
 
 @app.get('/web/users/<userid>')
