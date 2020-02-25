@@ -1,7 +1,7 @@
 import bottle
 from bottle import get, post, route, request, response, abort, static_file
 from bottle.ext import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, Sequence, String, ARRAY, desc
+from sqlalchemy import create_engine, Column, Integer, Sequence, String, Boolean, ARRAY, desc
 from sqlalchemy.ext.declarative import declarative_base
 import json
 import collections
@@ -17,7 +17,7 @@ import base64
 
 
 PROTOCOL='https'
-HOSTNAME='22.misoni.club'
+HOSTNAME='clione.misoni.club'
 URL=PROTOCOL+'://'+HOSTNAME
 PORT=5200
 SECRET='secret'
@@ -49,11 +49,9 @@ class User(Base):
     username = Column(String)
     password = Column(String)
     fullname = Column(String)
-    summary = Column(String)
+    summary = Column(String, default='')
     privatekey = Column(String)
     publickey = Column(String)
-    following = Column(ARRAY(String))
-    followers = Column(ARRAY(String))
 
     def __init__(self, username, password, fullname, summary, privatekey, publickey):
         self.username = username
@@ -72,16 +70,30 @@ class Post(Base):
     username = Column(String)
     posttext = Column(String)
     postdate = Column(String)
-    liked = Column(Integer)
+    liked = Column(Integer, default=0)
 
-    def __init__(self, username, posttext, postdate, liked):
+    def __init__(self, username, posttext, postdate):
         self.username = username
         self.posttext = posttext
         self.postdate = postdate
-        self.liked = liked
 
     def __repr__(self):
         return "<Post('%d', '%s', '%s', '%s', %d)>" % (self.id, self.username, self.posttext, self.postdate, self.liked)
+
+class Follow(Base):
+    __tablename__ = 'follow'
+    id = Column(Integer, primary_key=True)
+    username = Column(String)
+    following = Column(String)
+    inboxurl = Column(String)
+
+    def __init__(self, username, following, inboxurl):
+        self.username = username
+        self.following = following
+        self.inboxurl = inboxurl
+
+    def __repr__(self):
+        return "<Follow('%d', '%s', '%s')>" % (self.id, self.username, self.inboxurl)
 
 
 ##web
@@ -109,6 +121,7 @@ def index(db):
         <hr>
         <p><a href="/web/user">user</a></p>
         <p><a href="/web/post">post</a></p>
+        <p><a href="/web/search">search</a></p>
         <p><a href="/auth/logout">logout</a></p>
     '''
 
@@ -137,14 +150,24 @@ def user(db):
         <form action="/web/user" method="post">
             <p>fullname: <input name="fullname" type="text" /></p>
             <p>summary: <input name="summary" type="text" /><p>
-            <p><input value="update user(未実装)" type="submit" /></p>
+            <p><input value="update user" type="submit" /></p>
         </form>
     '''.format(username=user.username, hostname=HOSTNAME, fullname=user.fullname, summary=user.summary)
 
 @app.post('/web/user')
 def do_user(db):
-    #update user profile
-    pass
+    userid = request.get_cookie('userid', secret=SECRET)
+    if not userid:
+        return 'invalid session'
+    user = db.query(User).filter_by(id=userid).first()
+    if not user:
+        return 'invalid user'
+    fullname = request.forms.getunicode('fullname')
+    if fullname:
+        db.query(User).update({User.fullname: fullname})
+    if summary:
+        db.query(User).update({User.summary: summary})
+    return 'done'
 
 @app.get('/web/post')
 def post(db):
@@ -170,11 +193,15 @@ def do_post(db):
     if not user:
         return 'invalid user'
     username = user.username
-    posttext = request.forms.get('posttext')
+    posttext = request.forms.getunicode('posttext')
     if not posttext:
         return 'this posttext is empty'
     postdate = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).isoformat(timespec='seconds')
-    post = Post(username=username, posttext=posttext, postdate=postdate, liked=0)
+    post = Post(
+        username=username,
+        posttext=posttext,
+        postdate=postdate
+    )
     db.add(post)
     post = db.query(Post).order_by(desc(Post.id)).first()
     note = collections.OrderedDict()
@@ -194,6 +221,23 @@ def do_post(db):
         'type': 'Create',
         'object': note
     }
+    if db.query(Follow).filter_by(username=username).scalar():
+        follows = db.query(Follow).filter_by(username=username).all()
+        follow = follows[0]
+        #http header signature---
+        date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+        signed_string = 'date: {date}'.format(date=date)
+        signer = PKCS1_v1_5.new(RSA.importKey(user.privatekey.encode()))
+        signature = base64.b64encode(signer.sign(SHA256.new(signed_string.encode()))).decode()
+        headers = {
+            'date': date,
+            'signature': 'keyId="'+URL+'/activitypub/'+username+'",algorithm="rsa-sha256",signature="'+signature+'"',
+            'Content-Type': 'application/activity+json'
+        }
+        #---http header signature
+        res = requests.post(follow.inboxurl, json=create, headers=headers)
+        if res.status_code != 202:
+            print(res.status_code)
     return 'done: '+posttext
 
 @app.get('/web/users/<userid>')
@@ -209,6 +253,148 @@ def posts(db, postid):
         return 'this post id is not found'
     post = db.query(Post).filter_by(id=postid).first()
     return 'posttext: '+post.posttext
+
+@app.get('/web/search')
+def search(db):
+    userid = request.get_cookie('userid', secret=SECRET)
+    if not userid:
+        return 'invalid session'
+    user = db.query(User).filter_by(id=userid).first()
+    if not user:
+        return 'invalid user'
+    return '''
+        example: acct:username@hostname.com
+        <form action="/web/search" method="post">
+            search: <input name="target" type="text" />
+            <input value="search" type="submit" />
+        </form>
+    '''
+
+@app.post('/web/search')
+def do_search(db):
+    userid = request.get_cookie('userid', secret=SECRET)
+    if not userid:
+        return 'invalid session'
+    user = db.query(User).filter_by(id=userid).first()
+    if not user:
+        return 'invalid user'
+    target = request.forms.getunicode('target')
+    if not target:
+        return 'target is empty'
+    if target.startswith('acct:'):
+        if target.count(':') != 1:
+            return 'invalid target'
+        if target.count('@') != 1:
+            return 'invalid target'
+        username = target.split(':')[1].split('@')[0]
+        hostname = target.split(':')[1].split('@')[1]
+        res = requests.get('https://'+hostname+'/.well-known/webfinger?resource=acct:{}@{}'.format(username,hostname),headers={'Accept':'application/ld+json'})
+        if res.status_code != 200:
+            return 'target not found: webfinger'
+        webfinger = res.json()
+        actor_url = ''
+        if not 'links' in webfinger:
+            return 'target not found: webfinger'
+        for link in webfinger['links']:
+            if 'type' in link:
+                if link['type'] == 'application/activity+json':
+                    if 'href' in link:
+                        actor_url = link['href']
+        print(actor_url)
+        res = requests.get(actor_url,headers={'Accept':'application/activity+json'})
+        if res.status_code != 200:
+            return 'target not found: actor'
+        actor = res.json()
+        iconurl = '/clione.png'
+        if 'icon' in actor:
+            if 'url' in actor['icon']:
+                iconurl = actor['icon']['url']
+
+        return '''
+            <img src="{iconurl}">
+            <p>username@hostname: {username}@{hostname}</p>
+            <p>fullname: {fullname}</p>
+            <p>summary: {summary}</p>
+        '''.format(iconurl=iconurl,username=username, hostname=hostname, fullname=actor['name'], summary=actor['summary'])
+    return 'is not acct:'
+
+@app.get('/web/rmtf')
+def rmtf(db):
+    userid = request.get_cookie('userid', secret=SECRET)
+    if not userid:
+        return 'invalid session'
+    user = db.query(User).filter_by(id=userid).first()
+    if not user:
+        return 'invalid user'
+    return '''
+        example: acct:username@hostname.com
+        <form action="/web/rmtf" method="post">
+            follow: <input name="target" type="text" />
+            <input value="follow" type="submit" />
+        </form>
+    '''
+
+@app.post('/web/rmtf')
+def do_rmtf(db):
+    userid = request.get_cookie('userid', secret=SECRET)
+    if not userid:
+        return 'invalid session'
+    user = db.query(User).filter_by(id=userid).first()
+    if not user:
+        return 'invalid user'
+    target = request.forms.getunicode('target')
+    if not target:
+        return 'target is empty'
+    if target.startswith('acct:'):
+        if target.count(':') != 1:
+            return 'invalid target'
+        if target.count('@') != 1:
+            return 'invalid target'
+        username = target.split(':')[1].split('@')[0]
+        hostname = target.split(':')[1].split('@')[1]
+        res = requests.get('https://'+hostname+'/.well-known/webfinger?resource=acct:{}@{}'.format(username,hostname),headers={'Accept':'application/ld+json'})
+        if res.status_code != 200:
+            return 'target not found: webfinger'
+        webfinger = res.json()
+        actor_url = ''
+        if not 'links' in webfinger:
+            return 'target not found: webfinger'
+        for link in webfinger['links']:
+            if 'type' in link:
+                if link['type'] == 'application/activity+json':
+                    if 'href' in link:
+                        actor_url = link['href']
+        res = requests.get(actor_url,headers={'Accept':'application/activity+json'})
+        if res.status_code != 200:
+            return 'target not found: actor'
+        actor = res.json()
+        follow = {
+            '@context': 'https://www.w3.org/ns/activitystreams',
+            'id': URL+'/activitypub/'+user.username,
+            'type': 'Follow',
+            'actor': URL+'/activitypub/'+user.username,
+            'object': actor['id']
+        }
+        #http header signature---
+        date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+        signed_string = 'date: {date}'.format(date=date)
+        signer = PKCS1_v1_5.new(RSA.importKey(user.privatekey.encode()))
+        signature = base64.b64encode(signer.sign(SHA256.new(signed_string.encode()))).decode()
+        headers = {
+            'date': date,
+            'signature': 'keyId="'+URL+'/activitypub/'+user.username+'",algorithm="rsa-sha256",signature="'+signature+'"',
+            'Content-Type': 'application/activity+json'
+        }
+        print(headers)
+        #---http header signature
+        res = requests.post(actor['inbox'], json=follow, headers=headers)
+        if res.status_code != 202:
+            return 'remote inbox error: {}'.format(str(res.status_code ))
+        #/inboxにてaccept受信後、DB更新
+        return 'follow request send'
+    return 'is not acct:'
+
+
 
 ##auth
 @app.get('/auth/register')
@@ -227,8 +413,8 @@ def register():
 def do_register(db):
     username = request.forms.get('username')
     password = request.forms.get('password')
-    fullname = request.forms.get('fullname')
-    summary = request.forms.get('summary')
+    fullname = request.forms.getunicode('fullname')
+    summary = request.forms.getunicode('summary')
     if not username:
         return 'this username is empty'
     if not username.isalnum():
@@ -239,7 +425,7 @@ def do_register(db):
         return 'this password is empty'
     if not password.isalnum():
         return 'this password contains characters that cannot be used'
-    if not password:
+    if not fullname:
         return 'this fullname is empty'
 
     rsa = RSA.generate(2048, Random.new().read)
@@ -349,6 +535,22 @@ def webfinger(db):
 def nodeinfo():
     pass
 
+##remote-follow #dont work
+@app.get('/authorize_interaction')
+def authorize_interaction(db):
+    uri = request.query.uri
+    if not uri:
+        abort(404)
+    if not uri.startswith('acct:'):
+        abort(404)
+    if uri.count(':') != 1:
+        abort(404)
+    if uri.count('@') != 1:
+        abort(404)
+    username = uri.split(':')[1].split('@')[0]
+    hostname = uri.split(':')[1].split('@')[1]
+    return bottle.Response('authorize_interaction: {}@{}'.format(username,hostname))
+
 ##activitypub
 @app.get('/activitypub/<username>')
 def person(db, username):
@@ -396,9 +598,9 @@ def person(db, username):
 
 @app.get('/activitypub/<username>/<noteid>')
 def note(db, username, noteid):
-    if not db.query(Post).filter_by(id=postid).scalar():
+    if not db.query(Post).filter_by(id=noteid).scalar():
         return 'this post id is not found'
-    post = db.query(Post).filter_by(id=postid).first()
+    post = db.query(Post).filter_by(id=noteid).first()
     if post.username != username:
         abort(404)
     note = collections.OrderedDict()
@@ -418,15 +620,16 @@ def note(db, username, noteid):
 
 @app.post('/activitypub/<username>/inbox')
 def user_inbox(db, username):
+    #署名確認しろ
+    #request.headers['Signature']
     if request.headers['Content-Type'] != 'application/activity+json':
         abort(404)
     inbox = json.loads(request.body.read().decode())
-    print(inbox)
-
     if not dict(inbox):
         abort(404)
     print(inbox['type'])
     if inbox['type'] == 'Follow':
+        print(inbox)
         if not db.query(User).filter_by(username=username).scalar():
             abort(404)
         user = db.query(User).filter_by(username=username).first()
@@ -457,7 +660,16 @@ def user_inbox(db, username):
         res = requests.post(remote_inbox_url, json=accept, headers=headers)
         if res.status_code != 202:
             abort(401)
-        return bottle.Response(status=201)
+        if not db.query(Follow).filter_by(username=username,following=remote_actor_url).scalar():
+            follow = Follow(
+                username=username,
+                following=remote_actor_url,
+                inboxurl=remote_inbox_url,
+            )
+            db.add(follow)
+
+        print('Follow fin')
+        return bottle.Response(status=202)
 
     if inbox['type'] == 'Undo':
         if not db.query(User).filter_by(username=username).scalar():
@@ -475,7 +687,6 @@ def user_inbox(db, username):
             'actor': URL+'/activitypub/'+username,
             'object': inbox
         }
-        print(accept)
         #http header signature---
         date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
         signed_string = 'date: {date}'.format(date=date)
@@ -490,7 +701,22 @@ def user_inbox(db, username):
         res = requests.post(remote_inbox_url, json=accept, headers=headers)
         if res.status_code != 202:
             abort(401)
-        return bottle.Response(status=201)
+        #Undo Follow---
+        if inbox['object']['type'] == 'Follow':
+            remote_actor_url = inbox['object']['actor']
+            if db.query(Follow).filter_by(username=username,following=remote_actor_url).scalar():
+                db.query(Follow).filter_by(username=username,following=remote_actor_url).delete()
+        #---Undo Follow
+        print('Undo fin')
+        return bottle.Response(status=202)
+
+    if inbox['type'] == 'Create':
+        print(json.dumps(inbox,indent=2))
+        return bottle.Response(status=202)
+
+    if inbox['type'] == 'Accept':
+        print(json.dumps(inbox,indent=2))
+        return bottle.Response(status=202)
 
 
 @app.get('/activitypub/<username>/outbox')
@@ -516,4 +742,4 @@ def user_outbox(db, username):
     return json.dumps(outbox, indent=2)
 
 #omaginai !!!
-app.run(host='localhost', port=8080, debug=True, reloader=True)
+app.run(server='waitress', host='localhost', port=8080, debug=True, reloader=True)
