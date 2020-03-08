@@ -4,7 +4,7 @@ activitypub test server
 - [x] actor
 - [x] webfinger(actor)
 - [x] inbox(follow,undo follow)
-- [ ] remote_follow
+- [x] remote_follow
 - [x] post text, delivery follower inbox
 - [ ] reply
 - [ ] inbox(like)
@@ -14,3 +14,4 @@ activitypub test server
 - [ ] shared inbox
 - [ ] shared outbox
 - [ ] group
+- [ ] コードをきれいに
