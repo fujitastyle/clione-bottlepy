@@ -1,6 +1,9 @@
 # clione
 activitypub test server
 
+#2020.06.02
+- [ ] aiohttpで書き直す
+
 - [x] actor
 - [x] webfinger(actor)
 - [x] inbox(follow,undo follow)
